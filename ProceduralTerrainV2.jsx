@@ -1,5 +1,58 @@
-import React, { useEffect, useRef, useState, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import * as THREE from 'three';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TILE COORDINATE SYSTEM - Deterministic seed generation for adjacent tiles
+// ═══════════════════════════════════════════════════════════════════════════════
+const TILE_DIRECTIONS = {
+  NW: { x: -1, z: -1, name: 'North-West' },
+  N:  { x:  0, z: -1, name: 'North' },
+  NE: { x:  1, z: -1, name: 'North-East' },
+  W:  { x: -1, z:  0, name: 'West' },
+  C:  { x:  0, z:  0, name: 'Center' },
+  E:  { x:  1, z:  0, name: 'East' },
+  SW: { x: -1, z:  1, name: 'South-West' },
+  S:  { x:  0, z:  1, name: 'South' },
+  SE: { x:  1, z:  1, name: 'South-East' },
+};
+
+// Generate deterministic seed for a tile at given coordinates
+function getTileSeed(baseSeed, tileX, tileZ) {
+  if (tileX === 0 && tileZ === 0) return baseSeed;
+  
+  // Create a deterministic hash combining base seed with tile coordinates
+  const coordString = `${baseSeed}_tile_${tileX}_${tileZ}`;
+  let hash = 0;
+  for (let i = 0; i < coordString.length; i++) {
+    const char = coordString.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  
+  // Convert to alphanumeric seed string
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let tileSeed = '';
+  let h = Math.abs(hash);
+  for (let i = 0; i < 16; i++) {
+    tileSeed += chars[h % chars.length];
+    h = Math.floor(h / chars.length) + (hash >> i);
+    h = Math.abs(h);
+  }
+  
+  return tileSeed;
+}
+
+// Get all adjacent tile seeds
+function getAdjacentTileSeeds(baseSeed) {
+  const seeds = {};
+  Object.entries(TILE_DIRECTIONS).forEach(([key, dir]) => {
+    seeds[key] = {
+      ...dir,
+      seed: getTileSeed(baseSeed, dir.x, dir.z)
+    };
+  });
+  return seeds;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SEEDED PRNG - Mulberry32 algorithm for deterministic randomness
@@ -261,17 +314,22 @@ function getMaskInfluence(worldX, worldZ, mask, gridSize, cellSize) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // STRUCTURE LAYER DATA
 // ═══════════════════════════════════════════════════════════════════════════════
-function createStructureLayerData(seed, structures = []) {
+function createStructureLayerData(baseSeed, tileX, tileZ, structures = []) {
   return {
     version: '2.0',
-    seed,
+    baseSeed,
+    tileCoord: { x: tileX, z: tileZ },
+    tileSeed: getTileSeed(baseSeed, tileX, tileZ),
     timestamp: Date.now(),
-    structures: structures.map(s => ({ id: s.id, type: s.type, gridX: s.gridX, gridZ: s.gridZ, width: s.width, height: s.height, depth: s.depth, radius: s.radius })),
+    structures: structures.map(s => ({ 
+      id: s.id, type: s.type, gridX: s.gridX, gridZ: s.gridZ, 
+      width: s.width, height: s.height, depth: s.depth, radius: s.radius 
+    })),
   };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// THREE.JS SCENE MANAGER
+// THREE.JS SCENE MANAGER - Now with multi-tile support
 // ═══════════════════════════════════════════════════════════════════════════════
 class TerrainSceneManager {
   constructor(container) {
@@ -286,25 +344,30 @@ class TerrainSceneManager {
     this.camera.position.set(40, 30, 40);
     this.camera.lookAt(0, 0, 0);
     
-    this.scene.fog = new THREE.Fog(0x050505, 60, 150);
+    this.scene.fog = new THREE.Fog(0x050505, 80, 200);
     this.scene.add(new THREE.AmbientLight(0xffffff, 0.6));
     const dirLight = new THREE.DirectionalLight(0xffffff, 0.5);
     dirLight.position.set(50, 50, 25);
     this.scene.add(dirLight);
     
-    this.terrainMesh = null;
-    this.terrainWire = null;
+    this.terrainGroup = new THREE.Group();
+    this.adjacentTerrainGroup = new THREE.Group();
     this.structureGroup = new THREE.Group();
     this.gridGroup = new THREE.Group();
     this.maskGroup = new THREE.Group();
     this.hoverIndicator = null;
+    this.tileBoundaries = new THREE.Group();
     
+    this.scene.add(this.terrainGroup);
+    this.scene.add(this.adjacentTerrainGroup);
     this.scene.add(this.structureGroup);
     this.scene.add(this.gridGroup);
     this.scene.add(this.maskGroup);
+    this.scene.add(this.tileBoundaries);
     
-    this.spherical = new THREE.Spherical();
-    this.spherical.setFromVector3(this.camera.position);
+    this.spherical = new THREE.Spherical(60, Math.PI / 4, Math.PI / 4);
+    this.camera.position.setFromSpherical(this.spherical);
+    this.camera.lookAt(0, 0, 0);
     
     this.setupControls();
     this.createBaseGrid();
@@ -344,24 +407,26 @@ class TerrainSceneManager {
     
     this.renderer.domElement.addEventListener('wheel', (e) => {
       e.preventDefault();
-      this.spherical.radius = Math.max(15, Math.min(120, this.spherical.radius + e.deltaY * 0.05));
+      this.spherical.radius = Math.max(20, Math.min(180, this.spherical.radius + e.deltaY * 0.08));
       this.camera.position.setFromSpherical(this.spherical);
       this.camera.lookAt(0, 0, 0);
     }, { passive: false });
   }
   
   createBaseGrid() {
-    const gridHelper = new THREE.GridHelper(100, 50, 0x2a2a2a, 0x1a1a1a);
+    const gridHelper = new THREE.GridHelper(300, 150, 0x2a2a2a, 0x1a1a1a);
     gridHelper.position.y = -0.1;
     this.scene.add(gridHelper);
   }
   
-  generateTerrain(seed, biomeType, resolution, size, mask, gridSize, cellSize, flattenHeight) {
-    if (this.terrainMesh) this.scene.remove(this.terrainMesh);
-    if (this.terrainWire) this.scene.remove(this.terrainWire);
-    
+  // Generate a single terrain tile with world-space coordinate offset
+  // Uses GLOBAL noise (from base seed) for seamless joins across all tiles
+  generateTerrainTile(baseSeed, biomeType, resolution, size, tileX, tileZ, mask, gridSize, cellSize, flattenHeight, isCenter = false) {
     const biome = BIOMES[biomeType] || BIOMES.grassland;
-    const rng = new SeededRNG(seed);
+    
+    // CRITICAL: Use the SAME seed (base seed) for ALL tiles to ensure seamless noise
+    // Each tile is just a "window" into the global noise field at different coordinates
+    const rng = new SeededRNG(baseSeed);
     const noise = new SeededNoise(rng);
     
     const geo = new THREE.PlaneGeometry(size, size, resolution, resolution);
@@ -371,17 +436,26 @@ class TerrainSceneManager {
     const colors = new Float32Array(positions.length);
     const vertexCount = (resolution + 1) * (resolution + 1);
     
+    // World offset based on tile coordinates
+    const offsetX = tileX * size;
+    const offsetZ = tileZ * size;
+    
     for (let i = 0; i < vertexCount; i++) {
-      const x = positions[i * 3];
-      const z = positions[i * 3 + 2];
+      const localX = positions[i * 3];
+      const localZ = positions[i * 3 + 2];
       
-      let height = noise.fractalNoise(x * biome.noiseScale, z * biome.noiseScale, biome.octaves, 2.0, 0.5);
-      height += noise.noise2D(x * biome.noiseScale * 3, z * biome.noiseScale * 3) * 0.15;
+      // WORLD-SPACE coordinates for seamless noise across tiles
+      const worldX = localX + offsetX;
+      const worldZ = localZ + offsetZ;
+      
+      let height = noise.fractalNoise(worldX * biome.noiseScale, worldZ * biome.noiseScale, biome.octaves, 2.0, 0.5);
+      height += noise.noise2D(worldX * biome.noiseScale * 3, worldZ * biome.noiseScale * 3) * 0.15;
       height = Math.max(-1, Math.min(1, height));
       
+      // Only apply mask to center tile
       let finalHeight = height;
-      if (mask && mask.size > 0) {
-        const influence = getMaskInfluence(x, z, mask, gridSize, cellSize);
+      if (isCenter && mask && mask.size > 0) {
+        const influence = getMaskInfluence(localX, localZ, mask, gridSize, cellSize);
         if (influence > 0) finalHeight = height * (1 - influence) + flattenHeight * influence;
       }
       
@@ -395,11 +469,107 @@ class TerrainSceneManager {
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     geo.computeVertexNormals();
     
-    this.terrainMesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.95 }));
-    this.scene.add(this.terrainMesh);
+    const solidMat = new THREE.MeshBasicMaterial({ 
+      vertexColors: true, 
+      side: THREE.DoubleSide, 
+      transparent: true, 
+      opacity: isCenter ? 0.95 : 0.7 
+    });
+    const solidMesh = new THREE.Mesh(geo, solidMat);
+    solidMesh.position.set(offsetX, 0, offsetZ);
     
-    this.terrainWire = new THREE.Mesh(geo.clone(), new THREE.MeshBasicMaterial({ color: biome.wireColor, wireframe: true, transparent: true, opacity: 0.6 }));
-    this.scene.add(this.terrainWire);
+    const wireMat = new THREE.MeshBasicMaterial({ 
+      color: biome.wireColor, 
+      wireframe: true, 
+      transparent: true, 
+      opacity: isCenter ? 0.6 : 0.25 
+    });
+    const wireMesh = new THREE.Mesh(geo.clone(), wireMat);
+    wireMesh.position.set(offsetX, 0, offsetZ);
+    
+    return { solid: solidMesh, wire: wireMesh };
+  }
+  
+  // Generate center tile only (editor mode)
+  generateTerrain(seed, biomeType, resolution, size, mask, gridSize, cellSize, flattenHeight) {
+    while (this.terrainGroup.children.length) this.terrainGroup.remove(this.terrainGroup.children[0]);
+    
+    const { solid, wire } = this.generateTerrainTile(seed, biomeType, resolution, size, 0, 0, mask, gridSize, cellSize, flattenHeight, true);
+    this.terrainGroup.add(solid);
+    this.terrainGroup.add(wire);
+  }
+  
+  // Generate all 9 tiles for preview mode
+  generatePreviewTerrain(baseSeed, biomeType, resolution, size, mask, gridSize, cellSize, flattenHeight) {
+    while (this.terrainGroup.children.length) this.terrainGroup.remove(this.terrainGroup.children[0]);
+    while (this.adjacentTerrainGroup.children.length) this.adjacentTerrainGroup.remove(this.adjacentTerrainGroup.children[0]);
+    while (this.tileBoundaries.children.length) this.tileBoundaries.remove(this.tileBoundaries.children[0]);
+    
+    // Generate all 9 tiles using the SAME base seed for seamless terrain
+    Object.entries(TILE_DIRECTIONS).forEach(([key, tileInfo]) => {
+      const isCenter = key === 'C';
+      const tileMask = isCenter ? mask : null;
+      
+      const { solid, wire } = this.generateTerrainTile(
+        baseSeed, biomeType, resolution, size, 
+        tileInfo.x, tileInfo.z, tileMask, gridSize, cellSize, flattenHeight, isCenter
+      );
+      
+      if (isCenter) {
+        this.terrainGroup.add(solid);
+        this.terrainGroup.add(wire);
+      } else {
+        this.adjacentTerrainGroup.add(solid);
+        this.adjacentTerrainGroup.add(wire);
+      }
+    });
+    
+    // Add tile boundary indicators
+    this.createTileBoundaries(size);
+  }
+  
+  createTileBoundaries(size) {
+    const halfSize = size / 2;
+    const boundaryMaterial = new THREE.LineBasicMaterial({ color: 0xff6600, transparent: true, opacity: 0.6 });
+    
+    // Create boundary lines for all 9 tiles
+    for (let tx = -1; tx <= 1; tx++) {
+      for (let tz = -1; tz <= 1; tz++) {
+        const cx = tx * size;
+        const cz = tz * size;
+        
+        const points = [
+          new THREE.Vector3(cx - halfSize, 0.3, cz - halfSize),
+          new THREE.Vector3(cx + halfSize, 0.3, cz - halfSize),
+          new THREE.Vector3(cx + halfSize, 0.3, cz + halfSize),
+          new THREE.Vector3(cx - halfSize, 0.3, cz + halfSize),
+          new THREE.Vector3(cx - halfSize, 0.3, cz - halfSize),
+        ];
+        
+        const geo = new THREE.BufferGeometry().setFromPoints(points);
+        const isCenter = tx === 0 && tz === 0;
+        const line = new THREE.Line(geo, isCenter 
+          ? new THREE.LineBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.8 })
+          : boundaryMaterial
+        );
+        this.tileBoundaries.add(line);
+        
+        // Add tile label
+        if (!isCenter) {
+          const labelGeo = new THREE.PlaneGeometry(3, 1.5);
+          labelGeo.rotateX(-Math.PI / 2);
+          const labelMat = new THREE.MeshBasicMaterial({ color: 0xff6600, transparent: true, opacity: 0.3, side: THREE.DoubleSide });
+          const labelMesh = new THREE.Mesh(labelGeo, labelMat);
+          labelMesh.position.set(cx, 0.2, cz - halfSize + 2);
+          this.tileBoundaries.add(labelMesh);
+        }
+      }
+    }
+  }
+  
+  clearAdjacentTerrain() {
+    while (this.adjacentTerrainGroup.children.length) this.adjacentTerrainGroup.remove(this.adjacentTerrainGroup.children[0]);
+    while (this.tileBoundaries.children.length) this.tileBoundaries.remove(this.tileBoundaries.children[0]);
   }
   
   updateStructureGrid(gridSize, cellSize, mask) {
@@ -605,13 +775,32 @@ export default function ProceduralTerrainV2() {
   const [biome, setBiome] = useState('grassland');
   const [resolution, setResolution] = useState(64);
   const [editorMode, setEditorMode] = useState(true);
+  const [previewMode, setPreviewMode] = useState(false);
+  const [showSeedPanel, setShowSeedPanel] = useState(false);
   const [selectedTool, setSelectedTool] = useState(null);
   const [structures, setStructures] = useState([]);
   const [gridSize, setGridSize] = useState(16);
   const [cellSize, setCellSize] = useState(3);
   const [hoveredCell, setHoveredCell] = useState(null);
+  const [tileSize] = useState(50);
   
   const terrainMask = useMemo(() => generateTerrainMask(structures, gridSize), [structures, gridSize]);
+  const adjacentSeeds = useMemo(() => getAdjacentTileSeeds(seed), [seed]);
+  
+  // Disable editor mode when preview is enabled
+  useEffect(() => {
+    if (previewMode && editorMode) {
+      setEditorMode(false);
+    }
+  }, [previewMode]);
+  
+  // Disable preview mode when editor is enabled
+  useEffect(() => {
+    if (editorMode && previewMode) {
+      setPreviewMode(false);
+      sceneManagerRef.current?.clearAdjacentTerrain();
+    }
+  }, [editorMode]);
   
   useEffect(() => {
     if (!containerRef.current) return;
@@ -626,10 +815,19 @@ export default function ProceduralTerrainV2() {
   
   useEffect(() => {
     if (!sceneManagerRef.current) return;
-    sceneManagerRef.current.generateTerrain(seed, biome, resolution, 50, terrainMask, gridSize, cellSize, 0);
+    
+    if (previewMode) {
+      // Generate all 9 tiles
+      sceneManagerRef.current.generatePreviewTerrain(seed, biome, resolution, tileSize, terrainMask, gridSize, cellSize, 0);
+    } else {
+      // Generate only center tile
+      sceneManagerRef.current.clearAdjacentTerrain();
+      sceneManagerRef.current.generateTerrain(seed, biome, resolution, tileSize, terrainMask, gridSize, cellSize, 0);
+    }
+    
     sceneManagerRef.current.updateStructureGrid(gridSize, cellSize, terrainMask);
     sceneManagerRef.current.updateStructures(structures, gridSize, cellSize, 0);
-  }, [seed, biome, resolution, terrainMask, gridSize, cellSize, structures]);
+  }, [seed, biome, resolution, terrainMask, gridSize, cellSize, structures, previewMode, tileSize]);
   
   useEffect(() => {
     if (!sceneManagerRef.current || !editorMode) return;
@@ -678,12 +876,13 @@ export default function ProceduralTerrainV2() {
   };
   
   const handleExport = () => {
-    const data = createStructureLayerData(seed, structures);
+    // Export structure layer for center tile (0,0)
+    const data = createStructureLayerData(seed, 0, 0, structures);
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `terrain-structures-${seed}.json`;
+    a.download = `terrain-structures-${seed}-tile-0-0.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -734,10 +933,96 @@ export default function ProceduralTerrainV2() {
         </div>
         
         <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-          <input type="checkbox" checked={editorMode} onChange={(e) => setEditorMode(e.target.checked)} style={{ accentColor: '#0f0' }} />
+          <input type="checkbox" checked={editorMode} onChange={(e) => setEditorMode(e.target.checked)} style={{ accentColor: '#0f0' }} disabled={previewMode} />
           EDITOR MODE
         </label>
+        
+        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+          <input type="checkbox" checked={previewMode} onChange={(e) => setPreviewMode(e.target.checked)} style={{ accentColor: '#ff6600' }} disabled={editorMode} />
+          <span style={{ color: previewMode ? '#ff6600' : '#0f0' }}>PREVIEW MODE</span>
+        </label>
+        
+        {previewMode && (
+          <button onClick={() => setShowSeedPanel(!showSeedPanel)}
+            style={{ ...btnStyle, borderColor: '#ff6600', color: '#ff6600', marginTop: '4px' }}>
+            {showSeedPanel ? 'HIDE' : 'SHOW'} TILE SEEDS
+          </button>
+        )}
       </div>
+      
+      {/* Adjacent Seeds Panel */}
+      {previewMode && showSeedPanel && (
+        <div style={{ ...panelStyle, position: 'absolute', top: '16px', left: '250px', border: '1px solid #ff6600', minWidth: '320px', maxHeight: 'calc(100vh - 120px)', overflowY: 'auto', boxShadow: '0 0 20px rgba(255,102,0,0.2)' }}>
+          <div style={{ borderBottom: '1px solid #333', paddingBottom: '8px', marginBottom: '12px', letterSpacing: '2px', fontSize: '12px', color: '#ff6600' }}>◈ ADJACENT TILE SEEDS</div>
+          
+          {/* Visual grid representation */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '4px', marginBottom: '16px' }}>
+            {['NW', 'N', 'NE', 'W', 'C', 'E', 'SW', 'S', 'SE'].map(key => {
+              const tileInfo = adjacentSeeds[key];
+              const isCenter = key === 'C';
+              return (
+                <div key={key} style={{
+                  padding: '8px 4px',
+                  background: isCenter ? 'rgba(0,255,0,0.2)' : 'rgba(255,102,0,0.1)',
+                  border: `1px solid ${isCenter ? '#00ff00' : '#ff6600'}`,
+                  textAlign: 'center',
+                  fontSize: '10px',
+                }}>
+                  <div style={{ fontWeight: 'bold', color: isCenter ? '#00ff00' : '#ff6600' }}>{key}</div>
+                  <div style={{ opacity: 0.7, fontSize: '8px' }}>{tileInfo.x},{tileInfo.z}</div>
+                </div>
+              );
+            })}
+          </div>
+          
+          {/* Seed list */}
+          <div style={{ fontSize: '10px' }}>
+            {Object.entries(adjacentSeeds).map(([key, tileInfo]) => {
+              const isCenter = key === 'C';
+              return (
+                <div key={key} style={{ 
+                  display: 'flex', 
+                  justifyContent: 'space-between', 
+                  padding: '6px 4px',
+                  borderBottom: '1px solid #222',
+                  background: isCenter ? 'rgba(0,255,0,0.1)' : 'transparent',
+                }}>
+                  <span style={{ color: isCenter ? '#00ff00' : '#ff6600', minWidth: '70px' }}>
+                    {key} ({tileInfo.x},{tileInfo.z})
+                  </span>
+                  <span style={{ fontFamily: 'monospace', color: isCenter ? '#00ff00' : '#888', fontSize: '9px' }}>
+                    {tileInfo.seed}
+                  </span>
+                  <button 
+                    onClick={() => navigator.clipboard.writeText(tileInfo.seed)}
+                    style={{ 
+                      background: 'transparent', 
+                      border: 'none', 
+                      color: '#666', 
+                      cursor: 'pointer',
+                      padding: '0 4px',
+                      fontSize: '10px'
+                    }}
+                    title="Copy seed"
+                  >
+                    ⧉
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          
+          <div style={{ marginTop: '12px', paddingTop: '8px', borderTop: '1px solid #333', opacity: 0.6, fontSize: '9px', color: '#ff6600' }}>
+            TILE SIZE: {tileSize}u × {tileSize}u<br/>
+            ─────────────────────────<br/>
+            ALL TILES USE BASE SEED FOR<br/>
+            SEAMLESS TERRAIN GENERATION<br/>
+            ─────────────────────────<br/>
+            TILE SEEDS = UNIQUE IDs FOR<br/>
+            STRUCTURE LAYER EXPORTS
+          </div>
+        </div>
+      )}
       
       {/* Editor Panel */}
       {editorMode && (
@@ -793,12 +1078,15 @@ export default function ProceduralTerrainV2() {
           <div>SEED: {seed.substring(0, 12)}</div>
           <div>BIOME: {biomeData.name.toUpperCase()}</div>
           <div>GRID: {gridSize}×{gridSize}</div>
+          <div style={{ color: previewMode ? '#ff6600' : '#0f0' }}>
+            MODE: {previewMode ? 'PREVIEW (9 TILES)' : editorMode ? 'EDITOR' : 'VIEW'}
+          </div>
         </div>
       </div>
       
       {/* Footer */}
       <div style={{ position: 'absolute', bottom: '16px', right: '16px', color: '#333', fontSize: '10px', letterSpacing: '2px', fontFamily: 'monospace' }}>
-        PROCEDURAL TERRAIN v2.0 • STRUCTURE LAYER
+        PROCEDURAL TERRAIN v2.0 • {previewMode ? 'ADJACENT TILE PREVIEW' : 'STRUCTURE LAYER'}
       </div>
     </div>
   );
